@@ -17,7 +17,7 @@ spec:
       # No imagePullSecrets required if registries.yaml is configured on the node
       containers:
         - name: dummy
-          image: ghcr.io/alvin-muchelle/alvin-muchelle/dummy-k3s-app:v1
+          image: ghcr.io/alvin-muchelle/dummy-k3s-app:v2
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
