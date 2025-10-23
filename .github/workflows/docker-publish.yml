@@ -34,12 +34,13 @@ jobs:
           # prefer GHCR_PAT if set, fall back to GITHUB_TOKEN
           password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
-      - name: Build and push image
+      - name: Build and push (multi-arch)
         uses: docker/build-push-action@v4
         with:
           context: .
-          push: true
           file: ./Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
           tags: |
             ${{ env.IMAGE_NAME }}:${{ github.sha }}
             ${{ env.IMAGE_NAME }}:v1.0.${{ github.run_number }}
