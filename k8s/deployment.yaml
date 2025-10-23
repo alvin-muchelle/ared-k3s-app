@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
         - name: ared
-          image: ghcr.io/alvin-muchelle/alvin-muchelle/ared-k3s-app:v1.0.4
+          image: ghcr.io/alvin-muchelle/alvin-muchelle/ared-k3s-app:v1.0.5
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
