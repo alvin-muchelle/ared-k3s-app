@@ -1,303 +1,455 @@
-# README — k3s + Traefik + App (Frontend + Backend) — Debug, Permanent fixes, Deployment, GHCR, DNS
+# README — k3s + Traefik + app (HTTPS) — full notes & next steps
 
-> This README was generated from the live troubleshooting session and contains the commands, observations, fixes and deployment steps taken on the **ared-distro** test device running **k3s**. It also includes next steps for DNS (CNAME / A record), PAT/registry guidance and Kubernetes manifest templates.
-
----
-
-## Table of contents
-
-1. Situation summary (what we observed)
-2. Root causes discovered
-3. Permanent fix applied for pod DNS/resolv.conf
-4. Recreating CoreDNS and other system pods
-5. Traefik NodePort, Ingress and TLS verification (what we did)
-6. How to simulate `curl --resolve` behavior from a browser (Windows & Linux tips)
-7. Commands to get node IP and NodePort
-8. GHCR (ghcr.io) authentication, secrets and PAT guidance
-9. Deploying frontend + backend images (manifests summary & imagePullSecrets)
-10. Image tag best practices (latest vs digest-pinned)
-11. Where to run `kubectl create secret docker-registry` (the device) and example
-12. Next steps: attach a name (A/CNAME) for future DNS resolution
-13. Troubleshooting checklist & useful commands
+This README collects everything from our troubleshooting session, the exact commands and configuration snippets you ran, what we discovered, how TLS ended up working, how to test from curl and a browser (Windows), and recommended next steps to attach a DNS name / CNAME to the node IP for future resolution.
 
 ---
 
-## 1) Situation summary
+## High-level goal
 
-* Device `ared-distro` is running `k3s` (single-node cluster).
-* Several system pods (CoreDNS, helm-install job, other pods) were in CrashLoopBackOff. CoreDNS logs showed `plugin/forward: no nameservers found` and k3s logs showed errors like `open etc/k3s-resolv.conf: no such file or directory`.
-* `/etc/resolv.conf` on the host was using a local dnsmasq at `127.0.0.2` and not directly usable by pods.
-* k3s was attempting to use a `etc/k3s-resolv.conf` (relative path in logs) which did not exist.
-* Traefik was deployed as a Deployment in `kube-system`. A `NodePort` service was created for Traefik (mapped to node ports 30082, 30443, 32080). An `Ingress` (ared-ingress) with `host: traefik.local` and TLS secret `ared-tls` was applied in `default`.
-* `curl -k --resolve traefik.local:30443:192.168.20.1 https://traefik.local:30443/` returned `200 OK` (JSON from the app) — which confirms Traefik is terminating TLS and routing to the app.
+Run a small app in k3s on a single node, expose it through Traefik Ingress, terminate TLS on Traefik, and be able to access it from a browser over `https://traefik.local:30443/` (or similar) and confirm the app returns host/time JSON.
 
-## 2) Root causes discovered
+---
 
-* k3s couldn't find the resolv file for POD sandboxes: log errors `open etc/k3s-resolv.conf: no such file or directory`.
-* CoreDNS crashed with `plugin/forward: no nameservers found` because the upstream nameserver path the kubelet (k3s) was supposed to write/copy into pod sandboxes was missing or pointed to an empty file.
-* The host's `/run/systemd/resolve/resolv.conf` can be empty on some distros (systemd-resolved stub behavior). That led to an empty source file when `kubelet` was told to use it.
+## Environment (important facts)
 
-## 3) Permanent fix applied (how to instruct kubelet which resolv.conf to copy)
+* Single k3s node `ared-distro` (control-plane & worker)
 
-**Goal:** Make kubelet copy a valid resolv.conf into pod sandboxes.
+  * Node IP: `192.168.20.1`
+  * k3s version: `v1.28.7-k3s1`
+  * Container runtime: containerd
+* Traefik installed via Helm (deployment `traefik` in `kube-system`)
 
-Steps performed / recommended:
+  * Traefik Pod: `traefik-75845b8cf8-wfhw5`
+  * Exposed via NodePort service `traefik-nodeport` (namespace `kube-system`)
 
-1. Choose a stable resolv.conf path that kubelet can read. On this device we used `/etc/k3s-resolv.conf` (absolute path).
-2. Populate that file with the host's working resolver configuration. Example:
+    * NodePorts mapped: `80:30082`, `443:30443`, `8080:32080`
+    * Endpoint IP for Traefik pod: `10.42.0.23`
+* App deployed in `default` namespace with service `ared-service`:
 
-```sh
-sudo cp /etc/resolv.conf /etc/k3s-resolv.conf
-# verify
-sudo cat /etc/k3s-resolv.conf
+  * ClusterIP: `10.43.9.63`
+  * NodePort: `30081` → `targetPort:8080`
+  * Endpoint: `10.42.0.22:8080` (pod `ared-k3s-app-6694748458-kgp6s`)
+* Ingress `ared-ingress` in `default`:
+
+  * `ingressClassName: traefik`
+  * host: `traefik.local`
+  * tls secret: `ared-tls` (exists in `default`)
+* Host OS `resolv.conf` uses `127.0.0.2` (dnsmasq), and earlier k3s had issues with `etc/k3s-resolv.conf` missing.
+
+---
+
+## Problems found during troubleshooting
+
+1. **CoreDNS CrashLoop** — logs `plugin/forward: no nameservers found` and CrashLoopBackOff. Cause: kubelet/pod sandbox DNS config problem linked to `etc/k3s-resolv.conf` missing or resolv.conf misconfiguration.
+
+   * k3s logs: `open etc/k3s-resolv.conf: no such file or directory` and `Could not open resolv conf file`.
+   * You tried to make kubelet use `resolv-conf=/run/systemd/resolve/resolv.conf` by editing `/etc/rancher/k3s/config.yaml`, but that file was empty on your system.
+
+2. **Ingress & Traefik routing** — at first `curl` to node IP:30443 returned `404` (Traefik default). After creating NodePort service and Ingress + TLS secret, using `curl --resolve traefik.local:30443:192.168.20.1` returned a 200 OK and JSON from the app — meaning Traefik routing & TLS termination were functional.
+
+3. **Certificate** — the TLS secret `ared-tls` contained a self-signed certificate. Browsers will not trust that by default.
+
+4. **Testing from browsers** — browsers use OS DNS; while `curl --resolve` can bypass DNS, browsers require either:
+
+   * adding `traefik.local` → `192.168.20.1` to OS `hosts` file, **and**
+   * trusting the certificate (import into system trust store) OR using a CA-signed cert.
+
+---
+
+## Exact (useful) commands & config snippets used / reproduced
+
+### Useful kubectl and debugging commands
+
+```bash
+kubectl -n kube-system get pods -o wide
+kubectl get nodes -o wide
+kubectl -n kube-system describe pod coredns-6799fbcd5-hw76q
+kubectl -n kube-system logs coredns-6799fbcd5-hw76q -c coredns
+kubectl -n kube-system get svc traefik-nodeport -o wide
+kubectl -n default get svc ared-service -o wide
+kubectl -n default get endpoints ared-service -o yaml
+kubectl -n default get ingress ared-ingress -o yaml
 ```
 
-3. Tell k3s (kubelet) to use that file by adding `kubelet-arg` in `/etc/rancher/k3s/config.yaml` (create it if not present):
+### Traefik NodePort service applied (you created something like)
 
 ```yaml
-# /etc/rancher/k3s/config.yaml
+# saved/applied with kubectl apply -f -
+apiVersion: v1
+kind: Service
+metadata:
+  name: traefik-nodeport
+  namespace: kube-system
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/instance: traefik-kube-system
+    app.kubernetes.io/name: traefik
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8000
+      nodePort: 30082
+    - name: https
+      port: 443
+      targetPort: 8443
+      nodePort: 30443
+    - name: dashboard
+      port: 8080
+      targetPort: 8080
+      nodePort: 32080
+```
+
+### Ingress (you applied)
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ared-ingress
+  namespace: default
+spec:
+  ingressClassName: traefik
+  rules:
+  - host: traefik.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: ared-service
+            port: { number: 80 }
+  tls:
+  - hosts:
+    - traefik.local
+    secretName: ared-tls
+```
+
+### TLS secret existed (base64 data present) — secret `ared-tls` in namespace `default`.
+
+> (I’m not reproducing whole base64 blobs here; you already have the secret.)
+
+### Useful curl commands you used
+
+* With node IP directly (Traefik default cert):
+
+```bash
+curl -k -v https://192.168.20.1:30443/
+```
+
+* With host override (SNI/Host header) — the one that worked:
+
+```bash
+curl -k --resolve traefik.local:30443:192.168.20.1 https://traefik.local:30443/ -v
+# or (verify using the exported cert)
+curl --cacert traefik.local.crt --resolve traefik.local:30443:192.168.20.1 https://traefik.local:30443/ -v
+```
+
+* To fetch TLS cert from the secret into a file:
+
+```bash
+kubectl -n default get secret ared-tls -o jsonpath='{.data.tls.crt}' | base64 --decode > traefik.local.crt
+```
+
+### k3s kubelet resolv-conf setting you added in `/etc/rancher/k3s/config.yaml`
+
+```yaml
+# instruct kubelet what resolv.conf to copy into pods
 kubelet-arg:
-  - "resolv-conf=/etc/k3s-resolv.conf"
+  - "resolv-conf=/run/systemd/resolve/resolv.conf"
 ```
 
-4. Restart k3s to pick up the config change:
+> Note: `/run/systemd/resolve/resolv.conf` on this system was empty. k3s reported errors like `open etc/k3s-resolv.conf: no such file or directory`. A common fix is to point kubelet at a working resolv.conf (e.g. `/etc/resolv.conf`) or create the expected `/etc/k3s-resolv.conf` and restart k3s.
 
-```sh
-sudo systemctl restart k3s
-# or on some devices
-sudo service k3s restart
-```
+---
 
-5. Verify k3s started normally and no `open etc/k3s-resolv.conf` errors appear in `journalctl -u k3s -f`.
+## How TLS ended up working (summary of the happy path)
 
-**Notes:**
+1. Traefik runs in k3s and exposes `websecure` on container port `8443`.
+2. You created `traefik-nodeport` mapping `8443` → node port `30443`.
+3. Ingress `ared-ingress` references host `traefik.local` and TLS secret `ared-tls`.
+4. Traefik picks up the Ingress and the TLS secret, terminates TLS for host `traefik.local`, and forwards the request to `ared-service` (which routes to your pod).
+5. `curl --resolve traefik.local:30443:192.168.20.1 https://traefik.local:30443/`:
 
-* Using an absolute file path (e.g. `/etc/k3s-resolv.conf`) avoids ambiguity. Do not place a relative path in the kubelet arg.
-* If your system uses `systemd-resolved` with an empty stub file, pick `/etc/resolv.conf` or create a static file you control and keep it updated.
+   * forces `traefik.local` to resolve to the node IP,
+   * makes a TLS handshake with Traefik (which presented the `traefik.local` cert),
+   * Traefik routed the HTTPS request to your app and returned JSON — **200 OK**.
 
-## 4) Recreate CoreDNS pods (safe steps)
+Therefore: **TLS termination and routing are correct and working** for the host `traefik.local` as long as the client SNI/Host is `traefik.local` and the client connects to the node IP:30443.
 
-Once the resolv.conf issue is fixed, restart or recreate CoreDNS to pick up the correct resolver:
+---
 
-```sh
-kubectl -n kube-system get pods -l k8s-app=kube-dns
-# delete the pods so the controller recreates them
-kubectl -n kube-system delete pod -l k8s-app=kube-dns
-# OR restart the deployment (if CoreDNS deployed as deployment)
-kubectl -n kube-system rollout restart deployment coredns
-```
+## How to reproduce what you did (concise step-by-step)
 
-Watch logs for the coreDNS container:
+1. Ensure Traefik deployment is running in `kube-system` and NodePort service exists exposing 8443 → 30443:
 
-```sh
-kubectl -n kube-system logs -l k8s-app=kube-dns -c coredns -f
-```
+   ```bash
+   kubectl -n kube-system get deployment traefik
+   kubectl -n kube-system get svc traefik-nodeport -o wide
+   ```
 
-Expect `plugin/forward` warnings to disappear and `Ready` to become `True`.
+2. Confirm your app and service:
 
-## 5) Traefik NodePort, Ingress and TLS verification — what we did and why it works
+   ```bash
+   kubectl -n default get pods -l app=ared-k3s-app -o wide
+   kubectl -n default get svc ared-service -o wide
+   kubectl -n default get endpoints ared-service -o yaml
+   ```
 
-* A Traefik Deployment is running in `kube-system` with entrypoints `8000` (web), `8443` (websecure) and `8080` (dashboard).
-* A NodePort `traefik-nodeport` service exposes Traefik on the node: `80:30082`, `443:30443`, `8080:32080`.
-* The ingress `ared-ingress` in `default` points `traefik.local` to service `ared-service` on port `80`. TLS secret `ared-tls` exists in `default`.
-* From the node, this curl succeeded (simulating client with Host header):
+3. Confirm Ingress references `traefik.local` and `ared-tls`:
 
-```sh
-curl -k --resolve traefik.local:30443:192.168.20.1 https://traefik.local:30443/
-# returns the JSON payload from the app -> TLS + routing working
-```
+   ```bash
+   kubectl -n default get ingress ared-ingress -o yaml
+   kubectl -n default get secret ared-tls -o yaml
+   ```
 
-That command both forces DNS resolution to `192.168.20.1` for `traefik.local` and connects to node port `30443` which Traefik is listening on. Traefik matches the `Host: traefik.local:30443` and uses the TLS secret to terminate.
+4. Test from the node using curl (works without modifying OS hosts because we used `--resolve`):
 
-**Conclusion:** Traefik + TLS + ingress route to app is functioning when client resolves traefik.local to node IP and connects to NodePort 30443.
+   ```bash
+   curl -k --resolve traefik.local:30443:192.168.20.1 https://traefik.local:30443/
+   # or to validate the cert without -k:
+   kubectl -n default get secret ared-tls -o jsonpath='{.data.tls.crt}' | base64 --decode > traefik.local.crt
+   curl --cacert traefik.local.crt --resolve traefik.local:30443:192.168.20.1 https://traefik.local:30443/
+   ```
 
-## 6) How to simulate `curl --resolve` from a browser
+---
 
-**Options (choose what suits you):**
+## How to access the HTTPS site from a browser (Windows example)
 
-### A — Edit your client hosts file (recommended if you have admin rights)
+Browsers respect the OS DNS and certificate trust stores. To make `https://traefik.local:30443/` load without `--resolve` and without certificate errors, do both steps below.
 
-* Linux / macOS: edit `/etc/hosts` (requires `sudo`).
-* Windows: edit `C:\Windows\System32\drivers\etc\hosts` (requires Administrator privileges). Add:
+### 1) Make `traefik.local` resolve to `192.168.20.1` (on Windows)
 
-```
-192.168.20.1 traefik.local
-```
-
-Then open `https://traefik.local:30443/` in the browser and accept the self-signed cert or import the `.crt` into the OS trust store (see below).
-
-**Windows note:** you must run the editor as Administrator. If you can't run Notepad as Admin, run an elevated PowerShell and append the line:
+Run PowerShell **as Administrator** and append the hosts file:
 
 ```powershell
-Start-Process notepad -Verb runAs
-# OR -- elevated append (if you have admin rights already in that shell):
-Add-Content -Path 'C:\Windows\System32\drivers\etc\hosts' -Value '192.168.20.1 traefik.local'
+# Open an elevated PowerShell (Run as Administrator)
+# Then append:
+Add-Content -Path "$env:Windir\System32\drivers\etc\hosts" -Value "192.168.20.1 traefik.local"
+# or if you prefer a direct echo:
+"192.168.20.1 traefik.local" | Out-File -FilePath "$env:Windir\System32\drivers\etc\hosts" -Encoding ASCII -Append
 ```
 
-If you *absolutely cannot* edit hosts (no admin), use one of the methods below.
+If you can use Notepad elevated:
 
-### B — Launch Chrome/Edge with host resolver rules (no hosts edit required)
-
-Create a browser shortcut and append this flag to the target:
-
-```
---host-resolver-rules="MAP traefik.local 192.168.20.1"
+```powershell
+Start-Process notepad.exe -Verb runAs
+# then edit: C:\Windows\System32\drivers\etc\hosts  (add a line)
 ```
 
-Example `Target` on Windows (in a shortcut):
+### 2) Trust the certificate in Windows
 
-```
-"C:\Program Files\Google\Chrome\Application\chrome.exe" --host-resolver-rules="MAP traefik.local 192.168.20.1"
-```
+Export the certificate from Kubernetes (on the node or any machine with `kubectl`) and copy it to the Windows machine:
 
-This makes the browser resolve `traefik.local` to the IP without changing system hosts.
-
-### C — Use a browser extension to rewrite requests / set host header
-
-There are extensions (like Requestly) that can map hostnames to IPs or rewrite headers. Use them to set `Host: traefik.local` while sending the request to `192.168.20.1:30443`.
-
-### D — Import the self-signed certificate into OS/browser trust store to avoid warnings
-
-Export the cert (from Kubernetes secret or `tls.crt` used earlier) and import to:
-
-* Windows: `certmgr.msc` -> Trusted Root Certification Authorities (requires Admin)
-* macOS: Keychain Access -> System -> Add and trust (requires Admin)
-
-After importing, `https://traefik.local:30443/` will show as secure (if hostname matches cert CN / SAN).
-
-## 7) Commands to get node IP and NodePort
-
-* List nodes (show internal/External IP):
-
-```sh
-kubectl get nodes -o wide
-# to print internal IP only (first node):
-kubectl get nodes -o jsonpath='{range .items[0]}{.status.addresses[?(@.type=="InternalIP")].address}{end}\n'
+```bash
+kubectl -n default get secret ared-tls -o jsonpath='{.data.tls.crt}' | base64 --decode > traefik.local.crt
+# copy traefik.local.crt to the Windows machine
 ```
 
-* Show a service and its NodePort(s):
+On the Windows machine (elevated PowerShell), import to the Trusted Root:
 
-```sh
-kubectl -n default get svc ared-service -o wide
-# or get specific port value
-kubectl -n default get svc ared-service -o jsonpath='{.spec.ports[*].nodePort}\n'
-# convenience to see both node IP + nodePort to curl from outside:
-NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
-NODE_PORT=$(kubectl -n kube-system get svc traefik-nodeport -o jsonpath='{.spec.ports[?(@.name=="https")].nodePort}')
-echo $NODE_IP:$NODE_PORT
+```powershell
+certutil -addstore -f "Root" C:\path\to\traefik.local.crt
 ```
 
-## 8) GHCR (ghcr.io) authentication, secrets and PAT guidance
+After import:
 
-**Short answer:** You can use a Personal Access Token (classic) generated from a personal account to authenticate to `ghcr.io`, but that account must have the proper permissions to the package/repository in the organization. To download (pull) private packages you need `read:packages` on the PAT and your user must have read access. To publish (push) images, use `write:packages` and your account must have write rights.
+* Restart the browser.
+* Navigate to `https://traefik.local:30443/`.
+* It should load without certificate warnings and return the JSON from your app.
 
-**Important official points:**
+**If you do not import the cert** the browser will show a security warning (because it’s a self-signed cert). You can proceed past the warning in some browsers, but importing is cleaner.
 
-* GitHub Packages requires a personal access token (classic) for authentication (not the newer fine-grained PAT). The PAT must include the correct scopes (`read:packages`, `write:packages`, `delete:packages` as needed). Your GitHub user account also needs matching repository/org permissions.
-* For GitHub Actions running inside the same repository, the provided `GITHUB_TOKEN` can be used to publish/pull packages without storing a PAT.
+---
 
-(These two points are pulled from the GitHub Docs — see the citation in the chat.)
+## Alternate: Let’s Encrypt / ACME (recommended long-term)
 
-**Practical guidance:**
+If you want `traefik.local` accessible without manually trusting certs on clients, use a publicly trusted domain and configure Traefik’s ACME (Let’s Encrypt). Summary steps:
 
-* If you only need to **pull** images from `ghcr.io/ared-group/...` in your k3s cluster: create a secret with `--docker-username=<YOUR_GH_USER>` and `--docker-password=<YOUR_PAT>` where `<YOUR_GH_USER>` is the GitHub username of the account that has access to those packages. That account can be your personal user **if** it is a member (or otherwise has read access) to the repos/packages in the org. The token must have `read:packages` scope.
-* If you need to **push** to the org package space from CI or local runs, the PAT you use must belong to an account with write/publish permissions — typically either your user (if granted rights) or a machine/service account that has the proper permissions.
-* Alternatives: use a **machine user** (a dedicated GitHub user account) or GitHub Apps for more controlled automation, or rely on Actions' `GITHUB_TOKEN` when running inside GitHub Actions.
+1. Get a real domain (e.g., `example.com`) or a subdomain you control (e.g., `app.example.com`).
+2. Create an A record in your DNS that points `app.example.com` → `192.168.20.1`.
 
-**Example: create docker-registry secret on the device**
+   * If behind NAT, configure your router to forward ports 80/443 to the node or use DNS + a public IP.
+3. Configure Traefik to use ACME (via Helm values or static arguments) with a certificate resolver, for example:
 
-```sh
-kubectl create secret docker-registry ghcr-secret \
-  --docker-server=ghcr.io \
-  --docker-username="YOUR_GH_USER" \
-  --docker-password="YOUR_PAT" \
-  --docker-email="you@example.com" \
-  -n default
+   * enable `--certificatesResolvers.le.acme.httpChallenge.entryPoint=web`
+   * or `--certificatesResolvers.le.acme.tlsChallenge=true`
+   * supply an email for ACME
+   * configure persistent storage for ACME JSON
+4. Create an ingress for `app.example.com` and Traefik will obtain a certificate automatically.
+
+(If you want, I can produce exact Helm values/Traefik configuration for ACME.)
+
+---
+
+## How to attach a NAME / CNAME to the node IP for future DNS resolution
+
+You have a few options, depending on whether you control a public domain and whether the node IP is public or private:
+
+### Option A — (Simple) Edit your DNS provider to add an A record (best for public IPs)
+
+1. In the DNS admin for your domain add:
+
+   * `ared.example.com` A record → `192.168.20.1`
+2. TTL: your choice (lower for testing).
+3. If you want `traefik.local` globally, you must own `local` TLD (you don’t), so pick a real domain.
+
+### Option B — Use a CNAME to point at another name
+
+1. If you own `example.com` and want `traefik.example.com`, you can create:
+
+   * `traefik.example.com` CNAME → `some-other-host.example.com`
+   * and make `some-other-host.example.com` A→ `192.168.20.1`.
+
+### Option C — Use a dynamic DNS provider (if IP changes)
+
+1. Sign up for a dynamic DNS service (DuckDNS, No-IP, etc).
+2. Create a host `myhost.duckdns.org` → their service will map to your public IP and provide tools to update it when IP changes.
+3. You can also create a CNAME from your domain to the dynamic DNS name.
+
+### Option D — Use wildcard DNS services for local testing (less recommended)
+
+* `nip.io` or `sslip.io` allow you to create hostnames that include the IP (like `traefik.192.168.20.1.nip.io`) which resolve to the IP automatically. This can be useful for demos but not for production.
+
+### Important DNS/Network notes
+
+* If your node IP `192.168.20.1` is private and you want external users to reach it, you must expose the node to the public internet (public IP or NAT + port-forward).
+* For local LAN-only testing, editing each client’s `hosts` file is easiest.
+* To obtain trusted TLS (Let’s Encrypt) for a name pointing to your node, the domain must be publicly resolvable to the node's public IPs (or use DNS challenge).
+
+---
+
+## Troubleshooting checklist (if things break again)
+
+1. Verify Traefik pod is running:
+
+   ```bash
+   kubectl -n kube-system get pods -l app.kubernetes.io/name=traefik -o wide
+   kubectl -n kube-system logs deployment/traefik --tail=200
+   ```
+
+2. Verify `traefik-nodeport` endpoints are present:
+
+   ```bash
+   kubectl -n kube-system get endpoints traefik-nodeport -o yaml
+   ```
+
+   There should be the Traefik pod IP and ports 8443 (https) etc.
+
+3. Verify Ingress and TLS secret:
+
+   ```bash
+   kubectl -n default get ingress ared-ingress -o yaml
+   kubectl -n default get secret ared-tls -o yaml
+   ```
+
+4. Confirm app service has endpoints (at least one Ready):
+
+   ```bash
+   kubectl -n default get endpoints ared-service -o yaml
+   ```
+
+5. Test from node:
+
+   ```bash
+   curl -k --resolve traefik.local:30443:192.168.20.1 https://traefik.local:30443/
+   ```
+
+6. If CoreDNS fails / pods cannot start because of DNS config:
+
+   * Check `/etc/resolv.conf` on host.
+   * Create a resolv conf copy for k3s if necessary:
+
+     ```bash
+     sudo cp /etc/resolv.conf /etc/k3s-resolv.conf
+     # or set kubelet-arg to a valid resolv.conf in /etc/rancher/k3s/config.yaml
+     sudo systemctl restart k3s
+     ```
+   * Recreate CoreDNS pods:
+
+     ```bash
+     kubectl -n kube-system delete pod -l k8s-app=kube-dns
+     # or
+     kubectl -n kube-system rollout restart deployment coredns
+     ```
+   * Check k3s logs: `journalctl -u k3s -f`
+
+---
+
+## Next concrete tasks I recommend (pick one)
+
+1. **Short-term / dev-only** — keep self-signed TLS but trust it locally:
+
+   * Add `traefik.local` to your clients’ hosts files.
+   * Import `traefik.local.crt` into each client’s trusted root store.
+
+2. **Long-term / proper** — use a real DNS name + ACME:
+
+   * Get a real domain or subdomain.
+   * Add A record to point to your node public IP.
+   * Configure Traefik ACME (Let’s Encrypt) so certificates are automatically obtained and renewed.
+
+3. **Fix k3s DNS pod instability (CoreDNS)**:
+
+   * Make sure k3s/kubelet has a valid resolv-conf or create `/etc/k3s-resolv.conf` and restart k3s.
+   * Recreate CoreDNS pods.
+   * Confirm pods become Ready and cluster DNS works.
+
+---
+
+## Handy commands summary (copy/paste)
+
+Export cert from secret:
+
+```bash
+kubectl -n default get secret ared-tls -o jsonpath='{.data.tls.crt}' | base64 --decode > traefik.local.crt
 ```
 
-Place `imagePullSecrets:
+Test HTTPS (from node) with host override and ignore cert:
 
-* name: ghcr-secret` into your deployment YAML so k8s can pull private images.
-
-## 9) Deploying frontend + backend images (manifests and imagePullSecrets)
-
-**Short design**
-
-* You should create **two Deployments** (backend & frontend), two Services and one Ingress (frontend), because typically only the frontend is exposed externally via Ingress. The frontend talks to the backend via internal service DNS (`http://backend-svc:8080`) or similar.
-
-**Key points:**
-
-* Use `imagePullSecrets` in both deployments if images are private.
-* The frontend Deployment should include an Ingress/IngressRoute that maps the hostname (traefik.local) to the frontend service. The TLS secret `ared-tls` can be reused for the frontend Ingress.
-* The backend need not have external Ingress unless you want direct external access.
-
-(You previously asked for 6 manifest files. In the README doc attached I included templates for: `frontend-deployment.yaml`, `frontend-service.yaml`, `frontend-ingress.yaml`, `backend-deployment.yaml`, `backend-service.yaml`, and `backend-ingress.yaml` — these are stored in this README document itself.)
-
-## 10) Image tag best practices
-
-* `latest` is convenient for development but not recommended for production because it is not immutable and can make rollbacks / reproducibility difficult.
-* Prefer digest-pinned images: `ghcr.io/org/repo/image@sha256:<digest>` — this guarantees the exact image.
-* If using tags from CI, use a tag that contains `github.sha` or a release tag, or better store the digest and deploy using digest.
-
-How to get digest locally after pushing:
-
-```sh
-docker pull ghcr.io/ared-group/survey-management-system/frontend:latest
-docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/ared-group/survey-management-system/frontend:latest
-# result is like ghcr.io/ared-group/survey-management-system/frontend@sha256:abcdef...
+```bash
+curl -k --resolve traefik.local:30443:192.168.20.1 https://traefik.local:30443/
 ```
 
-Then put the digest string into your deployment yaml.
+Test HTTPS verifying against exported cert:
 
-## 11) Where to run `kubectl create secret docker-registry` (the device)
-
-* Run it **on the device** where `kubectl` is configured to talk to your k3s cluster (this can be the node itself — you are already `ssh`ed in there). The secret will be stored in the cluster in the selected namespace (e.g. `default`).
-* Example (run on the node where kubeconfig points to the k3s cluster):
-
-```sh
-kubectl create secret docker-registry ghcr-secret \
-  --docker-server=ghcr.io \
-  --docker-username="YOUR_GH_USER" \
-  --docker-password="YOUR_PAT" \
-  --docker-email="you@example.com" \
-  -n default
+```bash
+curl --cacert traefik.local.crt --resolve traefik.local:30443:192.168.20.1 https://traefik.local:30443/ -v
 ```
 
-* After that, include `imagePullSecrets:
+Add hosts entry on Windows (elevated PowerShell):
 
-  * name: ghcr-secret`in your`Deployment` spec for both frontend and backend.
-
-## 12) Next steps: attach a name/CNAME to the node IP for future DNS
-
-Options for production-stable name resolution:
-
-1. **Public DNS A record** (recommended for reachable nodes):
-
-   * In your DNS provider dashboard, create an `A` record for `traefik.example.com` pointing to the node's public IP.
-   * If you will scale to multiple nodes or use a LoadBalancer, point the domain to the LB IP.
-
-2. **CNAME** — Useful if you already have a host name managed elsewhere. Create a CNAME pointing at a DNS host that resolves to node IP.
-
-3. **Dynamic DNS** — If node IP changes, use a DDNS provider and point A or CNAME to the DDNS name.
-
-4. **For local testing** — keep using `/etc/hosts` edits or Chrome `--host-resolver-rules` for quick testing.
-
-**TLS propagation:** Once DNS resolves the name to the node IP, ensure your certificate SAN includes the hostname. For public certificates, use Let's Encrypt via a controller (IngressRoute + cert-manager or Traefik's ACME) or provide/manually create a certificate for that hostname and apply as Kubernetes secret.
-
-## 13) Troubleshooting checklist & useful commands
-
-* Check k3s logs:
-
-```sh
-sudo journalctl -u k3s -f
+```powershell
+# in elevated PowerShell:
+Add-Content -Path "$env:Windir\System32\drivers\etc\hosts" -Value "192.168.20.1 traefik.local"
 ```
 
-* Check CoreDNS logs:
+Import cert into Windows Trusted Root (elevated PowerShell):
 
-```sh
-kubectl -n kube-system get pods -l k8s-app=kube-dns -o wide
-kubectl -n kube-system logs -l k8s-app=kube-dns -c coredns -f
+```powershell
+certutil -addstore -f "Root" C:\path\to\traefik.local.crt
 ```
 
-* Check Traefik logs & routers/services via NodePort dashboard (bounded to 32080) or API if enabled.
+Restart CoreDNS (if DNS broken):
 
+```bash
+kubectl -n kube-system rollout restart deployment coredns
+# OR delete pods:
+kubectl -n kube-system delete pod -l k8s-app=kube-dns
+```
+
+Create `traefik-nodeport` service (already applied earlier):
+
+```bash
+# apply the YAML shown earlier
+kubectl -n kube-system apply -f traefik-nodeport.yaml
+```
+
+---
+
+## Final status (from the session)
+
+* **Working**: Traefik successfully terminates TLS and routes to your app when the client name is `traefik.local` and it connects to node IP `192.168.20.1` on nodeport `30443`.
+* **Caveat**: The TLS cert is self-signed; browsers will not trust it until you import it or switch to Let’s Encrypt or another CA.
+* **DNS**: `curl --resolve` was used to override DNS; to get browsers working you must either edit hosts file or set proper DNS (A/CNAME) records.
